@@ -184,6 +184,12 @@ func (u *Upstream) fillDynamicHost() {
 type Host struct {
 	numRequests atomic.Int64
 	fails       atomic.Int64
+	latency     latencyEstimate
+}
+
+// observeLatency records the latency of a completed response.
+func (h *Host) observeLatency(d time.Duration) {
+	h.latency.observe(d, time.Now())
 }
 
 // NumRequests returns the number of active requests to the upstream.

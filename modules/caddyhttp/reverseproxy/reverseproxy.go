@@ -281,6 +281,10 @@ type Handler struct {
 	// closed when their upstream is removed from the config.
 	tunnelTracker *tunnelTracker
 
+	// trackLatency is true when the selection policy uses
+	// upstream latency, so samples are only taken if needed.
+	trackLatency bool
+
 	ctx    caddy.Context
 	logger *zap.Logger
 	events *caddyevents.App
@@ -1247,6 +1251,12 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			}),
 			zap.Int("status", res.StatusCode),
 		)
+	}
+
+	// the sample spans the whole RoundTrip (dial, TLS, request
+	// upload) up to the response headers; the body is not included
+	if h.trackLatency {
+		di.Upstream.observeLatency(duration)
 	}
 
 	h.recordUpstreamRoundTrip(di, repl, res.StatusCode, duration)
