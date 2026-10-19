@@ -441,6 +441,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.LoadBalancing.SelectionPolicy == nil {
 		h.LoadBalancing.SelectionPolicy = RandomSelection{}
 	}
+	h.trackLatency = selectorConsumesLatency(h.LoadBalancing.SelectionPolicy)
 	if h.LoadBalancing.TryDuration > 0 && h.LoadBalancing.TryInterval == 0 {
 		// a non-zero try_duration with a zero try_interval
 		// will always spin the CPU for try_duration if the

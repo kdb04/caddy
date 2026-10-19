@@ -21,31 +21,33 @@ import (
 )
 
 const (
-	// latencyTau is the time constant of the decay when a lower sample arrives, higher sample replaces it.
+	// latencyTau is the time constant of the decay when a lower sample arrives;
+	// a higher sample replaces the estimate.
 	latencyTau = 10 * time.Second
-	// latencyStaleAfter is how long an estimate remains usable. 
+	// latencyStaleAfter is how long an estimate remains usable.
 	latencyStaleAfter = 6 * latencyTau
-	// latencyProbeInterval limits trial requests to unknown upstreams. 
+	// latencyProbeInterval limits trial requests to unknown upstreams.
 	latencyProbeInterval = time.Second
 )
 
 // latencyEstimate tracks response latency using a peak-sensitive moving average.
-// Its zero-value is ready to use. State is protected by mutex.
+// Its zero value is ready to use.
 type latencyEstimate struct {
-	mu      sync.Mutex
-	est     time.Duration
-	updated time.Time
-	samples uint64
-	nextProbe time.Time // nextProbe is the earliest time the next trial may be claimed.
+	mu        sync.Mutex
+	est       time.Duration
+	updated   time.Time
+	samples   uint64
+	nextProbe time.Time // earliest time the next trial may be claimed
 }
 
+// latencySnapshot is a consistent copy of a latencyEstimate.
 type latencySnapshot struct {
 	est     time.Duration
 	updated time.Time
 	samples uint64
 }
 
-// observer records a latency sample taken at 'now'. Production callers should
+// observe records a latency sample taken at now. Production callers should
 // pass `time.Now()` to preserve its monotonic clock reading.
 //
 // Older completions can only raise the estimate but not lower it or move the timestamp backwards.
@@ -77,7 +79,7 @@ func (l *latencyEstimate) snapshot() latencySnapshot {
 	}
 }
 
-// claimProbe reserves a trial request for this upstream. 
+// claimProbe reserves a trial request for this upstream.
 // At most one claim succeeds per latencyProbeInterval.
 func (l *latencyEstimate) claimProbe(now time.Time) bool {
 	l.mu.Lock()
@@ -89,25 +91,21 @@ func (l *latencyEstimate) claimProbe(now time.Time) bool {
 	return true
 }
 
-// known reports whether the snapshot has a recent latency sample. 
+// known reports whether the snapshot has a recent latency sample.
 func (s latencySnapshot) known(now time.Time) bool {
 	return s.samples > 0 && now.Sub(s.updated) <= latencyStaleAfter
 }
 
-// coldResult holds either a winner or two upstreams to compare. 
+// coldResult holds either a winner or two upstreams to compare.
 type coldResult struct {
 	winner  *Upstream
 	compare [2]*Upstream
 }
 
-// resolveCold handles candidate pairs containing an unknown latency estimate. 
-//
-// When both candidates are unknown, compare them against known upstreams
-// while limiting trail requests to one per probe interval.
-//
-// Without a known upstream there is nothing to bound against, and the
-// candidate with fewer active requests wins. A known upstream that starts
-// failing keeps its estimate until it goes stale.
+// resolveCold handles candidate pairs containing an unknown latency estimate.
+// While any available upstream is known, an unknown one is returned at most
+// once per latencyProbeInterval; claims are not refunded. Without a known
+// upstream, the candidate with fewer active requests wins.
 //
 // intn returns a random number in [0, n).
 func resolveCold(a, b *Upstream, pool UpstreamPool, now time.Time, intn func(int) int) coldResult {
@@ -128,7 +126,7 @@ func resolveCold(a, b *Upstream, pool UpstreamPool, now time.Time, intn func(int
 		return coldResult{winner: known}
 	}
 
-	// both unknown: reservoir sample two known 
+	// both unknown: reservoir sample two known
 	// available upstreams to bound them against
 	var sample [2]*Upstream
 	var count int

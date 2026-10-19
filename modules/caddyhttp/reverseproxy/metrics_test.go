@@ -8,7 +8,20 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// restoreStreamMetrics restores the stream collectors that a test replaces, so
+// later tests do not inherit collectors that cannot be registered.
+func restoreStreamMetrics(t *testing.T) {
+	t.Helper()
+	active, total := reverseProxyMetrics.streamsActive, reverseProxyMetrics.streamsTotal
+	duration, bytes := reverseProxyMetrics.streamDuration, reverseProxyMetrics.streamBytes
+	t.Cleanup(func() {
+		reverseProxyMetrics.streamsActive, reverseProxyMetrics.streamsTotal = active, total
+		reverseProxyMetrics.streamDuration, reverseProxyMetrics.streamBytes = duration, bytes
+	})
+}
+
 func TestTrackActiveStreamRecordsLifecycleAndBytes(t *testing.T) {
+	restoreStreamMetrics(t)
 	const upstream = "127.0.0.1:7443"
 
 	// Use fresh metric vectors for deterministic assertions in this unit test.
@@ -46,6 +59,7 @@ func TestTrackActiveStreamRecordsLifecycleAndBytes(t *testing.T) {
 }
 
 func TestTrackActiveStreamDoesNotCountZeroBytes(t *testing.T) {
+	restoreStreamMetrics(t)
 	const upstream = "127.0.0.1:9000"
 
 	reverseProxyMetrics.streamsActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"upstream"})
