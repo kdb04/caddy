@@ -20,9 +20,14 @@ import (
 	"time"
 )
 
-// latencyTau is the time constant of the decay when a lower sample arrives.
-// Higher samples replace the estimates entirely.
-const latencyTau = 10 * time.Second
+const (
+	// latencyTau is the time constant of the decay when a lower sample arrives, higher sample replaces it.
+	latencyTau = 10 * time.Second
+	// latencyStaleAfter is how long an estimate remains usable. 
+	latencyStaleAfter = 6 * latencyTau
+	// latencyProbeInterval limits trial requests to unknown upstreams. 
+	latencyProbeInterval = time.Second
+)
 
 // latencyEstimate tracks response latency using a peak-sensitive moving average.
 // Its zero-value is ready to use. State is protected by mutex.
@@ -31,6 +36,7 @@ type latencyEstimate struct {
 	est     time.Duration
 	updated time.Time
 	samples uint64
+	nextProbe time.Time // nextProbe is the earliest time the next trial may be claimed.
 }
 
 type latencySnapshot struct {
@@ -69,6 +75,108 @@ func (l *latencyEstimate) snapshot() latencySnapshot {
 		updated: l.updated,
 		samples: l.samples,
 	}
+}
+
+// claimProbe reserves a trial request for this upstream. 
+// At most one claim succeeds per latencyProbeInterval.
+func (l *latencyEstimate) claimProbe(now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.Before(l.nextProbe) {
+		return false
+	}
+	l.nextProbe = now.Add(latencyProbeInterval)
+	return true
+}
+
+// known reports whether the snapshot has a recent latency sample. 
+func (s latencySnapshot) known(now time.Time) bool {
+	return s.samples > 0 && now.Sub(s.updated) <= latencyStaleAfter
+}
+
+// coldResult holds either a winner or two upstreams to compare. 
+type coldResult struct {
+	winner  *Upstream
+	compare [2]*Upstream
+}
+
+// resolveCold handles candidate pairs containing an unknown latency estimate. 
+//
+// When both candidates are unknown, compare them against known upstreams
+// while limiting trail requests to one per probe interval.
+//
+// Without a known upstream there is nothing to bound against, and the
+// candidate with fewer active requests wins. A known upstream that starts
+// failing keeps its estimate until it goes stale.
+//
+// intn returns a random number in [0, n).
+func resolveCold(a, b *Upstream, pool UpstreamPool, now time.Time, intn func(int) int) coldResult {
+	knownA := a.latency.snapshot().known(now)
+	knownB := b.latency.snapshot().known(now)
+
+	switch {
+	case knownA && knownB:
+		return coldResult{compare: [2]*Upstream{a, b}}
+	case knownA != knownB:
+		known, unknown := a, b
+		if knownB {
+			known, unknown = b, a
+		}
+		if unknown.latency.claimProbe(now) {
+			return coldResult{winner: unknown}
+		}
+		return coldResult{winner: known}
+	}
+
+	// both unknown: reservoir sample two known 
+	// available upstreams to bound them against
+	var sample [2]*Upstream
+	var count int
+	for _, u := range pool {
+		if !u.Available() || !u.latency.snapshot().known(now) {
+			continue
+		}
+		count++
+		if count <= len(sample) {
+			sample[count-1] = u
+		} else if j := intn(count); j < len(sample) {
+			sample[j] = u
+		}
+	}
+
+	if count == 0 {
+		return coldResult{winner: fewerRequests(a, b, intn)}
+	}
+
+	first, second := a, b
+	if intn(2) == 1 {
+		first, second = b, a
+	}
+	if first.latency.claimProbe(now) {
+		return coldResult{winner: first}
+	}
+	if second.latency.claimProbe(now) {
+		return coldResult{winner: second}
+	}
+	if count == 1 {
+		return coldResult{winner: sample[0]}
+	}
+	return coldResult{compare: sample}
+}
+
+// fewerRequests returns the upstream with fewer active requests,
+// choosing randomly between equals.
+func fewerRequests(a, b *Upstream, intn func(int) int) *Upstream {
+	na, nb := a.NumRequests(), b.NumRequests()
+	switch {
+	case na < nb:
+		return a
+	case nb < na:
+		return b
+	case intn(2) == 0:
+		return a
+	}
+	return b
 }
 
 // peakEWMA calculates the updated estimate from a sample and elapsed time.
