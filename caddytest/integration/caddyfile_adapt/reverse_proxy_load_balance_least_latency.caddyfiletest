@@ -1,0 +1,41 @@
+:8884
+
+reverse_proxy 127.0.0.1:65535 127.0.0.1:35535 {
+	lb_policy least_latency
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":8884"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handler": "reverse_proxy",
+									"load_balancing": {
+										"selection_policy": {
+											"policy": "least_latency"
+										}
+									},
+									"upstreams": [
+										{
+											"dial": "127.0.0.1:65535"
+										},
+										{
+											"dial": "127.0.0.1:35535"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

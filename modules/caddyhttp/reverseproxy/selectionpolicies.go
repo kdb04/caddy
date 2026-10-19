@@ -40,6 +40,7 @@ func init() {
 	caddy.RegisterModule(RandomSelection{})
 	caddy.RegisterModule(RandomChoiceSelection{})
 	caddy.RegisterModule(LeastConnSelection{})
+	caddy.RegisterModule(LeastLatencySelection{})
 	caddy.RegisterModule(new(RoundRobinSelection))
 	caddy.RegisterModule(new(WeightedRoundRobinSelection))
 	caddy.RegisterModule(FirstSelection{})
@@ -315,6 +316,126 @@ func (r *LeastConnSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 	return nil
 }
+
+// LeastLatencySelection selects between two randomly chosen available
+// upstreams, preferring the one with the lower product of its recent
+// response latency and its number of active requests plus one.
+//
+// Latency is the time until response headers arrive. Any HTTP response,
+// including an error status, is recorded. Requests that fail before headers
+// arrive (connection errors, timeouts, cancellations) are not, so an upstream
+// that stops accepting connections keeps its last estimate until it goes
+// stale, and one that quickly returns error responses can look fast. This
+// policy complements health checks rather than replacing them.
+//
+// An upstream without a recent estimate is sent at most one request per
+// second while another upstream in the pool has one. If none do, the
+// candidate with fewer active requests is chosen.
+//
+// Estimates are shared by all handlers that use the same upstream address.
+type LeastLatencySelection struct{}
+
+// CaddyModule returns the Caddy module information.
+func (LeastLatencySelection) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.reverse_proxy.selection_policies.least_latency",
+		New: func() caddy.Module { return new(LeastLatencySelection) },
+	}
+}
+
+// Select returns an available host, if any.
+func (s LeastLatencySelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
+	return s.selectAt(pool, time.Now(), weakrand.IntN)
+}
+
+// selectAt is Select with the time and the source of randomness
+// supplied, so the choice can be tested deterministically.
+func (LeastLatencySelection) selectAt(pool UpstreamPool, now time.Time, intn func(int) int) *Upstream {
+	// reservoir sample two available upstreams, as random_choose does
+	var pair [2]*Upstream
+	var available int
+	for _, upstream := range pool {
+		if !upstream.Available() {
+			continue
+		}
+		available++
+		if available <= len(pair) {
+			pair[available-1] = upstream
+		} else if j := intn(available); j < len(pair) {
+			pair[j] = upstream
+		}
+	}
+	if available < len(pair) {
+		return pair[0]
+	}
+
+	res := resolveCold(pair[0], pair[1], pool, now, intn)
+	if res.winner != nil {
+		return res.winner
+	}
+	return lowerLatencyScore(res.compare[0], res.compare[1], intn)
+}
+
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
+//
+//	lb_policy least_latency
+func (s *LeastLatencySelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume policy name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	return nil
+}
+
+// latencyScore ranks an upstream by its latency estimate and active requests;
+// lower is better.
+func latencyScore(est time.Duration, active int) float64 {
+	// the floor keeps load visible when the estimate is zero, and adding
+	// one after the conversion cannot wrap for a huge active count
+	return float64(max(est, time.Nanosecond)) * (float64(max(active, 0)) + 1)
+}
+
+// lowerLatencyScore returns the upstream with the lower score. Equal scores
+// go to the one with fewer active requests, then to a random one.
+func lowerLatencyScore(a, b *Upstream, intn func(int) int) *Upstream {
+	activeA, activeB := max(a.NumRequests(), 0), max(b.NumRequests(), 0)
+	scoreA := latencyScore(a.latency.snapshot().est, activeA)
+	scoreB := latencyScore(b.latency.snapshot().est, activeB)
+	switch {
+	case scoreA < scoreB:
+		return a
+	case scoreB < scoreA:
+		return b
+	case activeA < activeB:
+		return a
+	case activeB < activeA:
+		return b
+	case intn(2) == 0:
+		return a
+	}
+	return b
+}
+
+// latencyConsumer is implemented by selection policies that use upstream
+// latency, directly or through a fallback policy, so that it is only
+// recorded when something reads it.
+type latencyConsumer interface {
+	consumesLatency() bool
+}
+
+// selectorConsumesLatency reports whether s uses upstream latency.
+func selectorConsumesLatency(s Selector) bool {
+	c, ok := s.(latencyConsumer)
+	return ok && c.consumesLatency()
+}
+
+func (LeastLatencySelection) consumesLatency() bool { return true }
+
+func (s *QueryHashSelection) consumesLatency() bool { return selectorConsumesLatency(s.fallback) }
+
+func (s *HeaderHashSelection) consumesLatency() bool { return selectorConsumesLatency(s.fallback) }
+
+func (s *CookieHashSelection) consumesLatency() bool { return selectorConsumesLatency(s.fallback) }
 
 // RoundRobinSelection is a policy that selects
 // a host based on round-robin ordering.
@@ -904,6 +1025,7 @@ var (
 	_ Selector = (*RandomSelection)(nil)
 	_ Selector = (*RandomChoiceSelection)(nil)
 	_ Selector = (*LeastConnSelection)(nil)
+	_ Selector = (*LeastLatencySelection)(nil)
 	_ Selector = (*RoundRobinSelection)(nil)
 	_ Selector = (*WeightedRoundRobinSelection)(nil)
 	_ Selector = (*FirstSelection)(nil)
@@ -920,6 +1042,12 @@ var (
 	_ caddy.Provisioner = (*RandomChoiceSelection)(nil)
 	_ caddy.Provisioner = (*WeightedRoundRobinSelection)(nil)
 
+	_ latencyConsumer = (*LeastLatencySelection)(nil)
+	_ latencyConsumer = (*QueryHashSelection)(nil)
+	_ latencyConsumer = (*HeaderHashSelection)(nil)
+	_ latencyConsumer = (*CookieHashSelection)(nil)
+
 	_ caddyfile.Unmarshaler = (*RandomChoiceSelection)(nil)
+	_ caddyfile.Unmarshaler = (*LeastLatencySelection)(nil)
 	_ caddyfile.Unmarshaler = (*WeightedRoundRobinSelection)(nil)
 )
