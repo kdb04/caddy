@@ -323,7 +323,7 @@ func (r *LeastConnSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //
 // Latency is a peak-sensitive moving average of the time from
 // the start of the round trip until the response headers arrive,
-// so it can include connection setup and request upload time.
+// so it includes connection setup, TLS and request-body backpressure.
 // A slower sample raises the estimate immediately, while faster
 // ones lower it gradually. Any HTTP response is recorded; failed
 // requests are not, so this policy complements health checks

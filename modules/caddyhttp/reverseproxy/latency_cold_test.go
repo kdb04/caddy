@@ -357,6 +357,29 @@ func TestResolveColdConcurrent(t *testing.T) {
 		}
 	})
 
+	t.Run("stale and known", func(t *testing.T) {
+		const stale = latencyStaleAfter + time.Second
+		slow := knownUpstream("192.0.2.1:80", 500*time.Millisecond, 0)
+		known := knownUpstream("192.0.2.2:80", 5*time.Millisecond, stale)
+		pool := UpstreamPool{slow, known}
+		now := latencyBase.Add(stale)
+
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for range 64 {
+			wg.Go(func() {
+				if resolveCold(slow, known, pool, now, rand.IntN).winner == slow {
+					wins.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+
+		if got := wins.Load(); got != 1 {
+			t.Errorf("trials = %d, want 1", got)
+		}
+	})
+
 	t.Run("two unknown", func(t *testing.T) {
 		u1, u2 := latencyUpstream("192.0.2.1:80"), latencyUpstream("192.0.2.2:80")
 		known := knownUpstream("192.0.2.3:80", 10*time.Millisecond, 0)
