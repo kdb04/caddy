@@ -115,7 +115,7 @@ func TestSelectorConsumesLatency(t *testing.T) {
 func stopCaddy(t *testing.T) { t.Cleanup(func() { _ = caddy.Stop() }) }
 
 // runHandlers runs a config with one reverse_proxy route per policy and
-// returns the provisioned handlers in order. A nil policy omits load_balancing.
+// returns the provisioned handlers in order. An empty policy string omits load_balancing.
 func runHandlers(t *testing.T, policies []string) []*Handler {
 	t.Helper()
 	var routes []string

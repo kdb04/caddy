@@ -178,6 +178,8 @@ func fewerRequests(a, b *Upstream, intn func(int) int) *Upstream {
 }
 
 // peakEWMA calculates the updated estimate from a sample and elapsed time.
+// Higher samples replace the estimate immediately; lower samples decay it
+// exponentially toward the sample.
 func peakEWMA(est, sample, elapsed time.Duration) time.Duration {
 	if sample >= est {
 		return sample

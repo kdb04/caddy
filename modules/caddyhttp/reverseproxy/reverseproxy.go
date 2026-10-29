@@ -1254,8 +1254,8 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 		)
 	}
 
-	// the sample spans the whole RoundTrip (dial, TLS, request
-	// upload) up to the response headers; the body is not included
+	// the sample spans the whole RoundTrip (dial, TLS, request-body
+	// backpressure) up to the response headers
 	if h.trackLatency {
 		di.Upstream.observeLatency(duration)
 	}

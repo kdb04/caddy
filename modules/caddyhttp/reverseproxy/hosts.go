@@ -180,7 +180,8 @@ func (u *Upstream) fillDynamicHost() {
 }
 
 // Host is the basic, in-memory representation of the state of a remote host.
-// Its fields are accessed atomically and Host values must not be copied.
+// The request and failure counters are accessed atomically, and the latency
+// estimate is guarded by its own mutex. Host values must not be copied.
 type Host struct {
 	numRequests atomic.Int64
 	fails       atomic.Int64

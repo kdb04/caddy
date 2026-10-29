@@ -107,7 +107,7 @@ func TestLatencyOutOfOrderPeakDominates(t *testing.T) {
 }
 
 // A late peak is applied at the newer timestamp, so the result is slower
-// than the chronological one (64.59ms): the error is on the conservative side.
+// than the chronological one: the error is on the conservative side.
 func TestLatencyOutOfOrderLatePeak(t *testing.T) {
 	const tolerance = 10 * time.Microsecond
 	ms := time.Millisecond

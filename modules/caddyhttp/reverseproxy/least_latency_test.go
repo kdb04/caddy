@@ -15,6 +15,7 @@
 package reverseproxy
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -411,5 +412,75 @@ func TestLeastLatencyConcurrentBound(t *testing.T) {
 		if got := int(chosen[i].Load()); got > limit {
 			t.Errorf("unknown upstream %d chosen %d times, want at most %d", i, got, limit)
 		}
+	}
+}
+
+// An upstream that never completes a request never gains an estimate, so it
+// must be bounded by the probe interval however often it is drawn.
+func TestLeastLatencyFailingUpstreamBounded(t *testing.T) {
+	const step = 10 * time.Millisecond
+	const window = 100 * time.Second
+	limit := 1 + int(window/latencyProbeInterval)
+
+	for _, failing := range []int{1, 2} {
+		t.Run(fmt.Sprintf("failing=%d", failing), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(uint64(failing), 1))
+			pool := UpstreamPool{knownUpstream("good", 5*time.Millisecond, 0)}
+			for i := range failing {
+				pool = append(pool, latencyUpstream(fmt.Sprintf("failing%d", i)))
+			}
+
+			counts := make(map[*Upstream]int)
+			for at := time.Duration(0); at < window; at += step {
+				now := latencyBase.Add(at)
+				got := LeastLatencySelection{}.selectAt(pool, now, rng.IntN)
+				counts[got]++
+				if got == pool[0] {
+					got.latency.observe(5*time.Millisecond, now)
+				}
+			}
+
+			for _, u := range pool[1:] {
+				if counts[u] == 0 || counts[u] > limit {
+					t.Errorf("%s selected %d times, want between 1 and %d", u.Dial, counts[u], limit)
+				}
+			}
+		})
+	}
+}
+
+// Concurrent requests that all draw an unknown upstream must not all be sent
+// to it: one reserves the probe and the rest go to the known upstream, and
+// the next probe is only available after the interval.
+func TestLeastLatencySelectConcurrentProbe(t *testing.T) {
+	known := knownUpstream("known", 5*time.Millisecond, 0)
+	unknown := latencyUpstream("unknown")
+	pool := UpstreamPool{known, unknown}
+
+	wave := func(now time.Time) (probes, others int32) {
+		var p, o atomic.Int32
+		var wg sync.WaitGroup
+		for range 64 {
+			wg.Go(func() {
+				switch (LeastLatencySelection{}).selectAt(pool, now, rand.IntN) {
+				case unknown:
+					p.Add(1)
+				case known:
+					o.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+		return p.Load(), o.Load()
+	}
+
+	if probes, others := wave(latencyBase); probes != 1 || others != 63 {
+		t.Errorf("first wave: %d probes and %d known, want 1 and 63", probes, others)
+	}
+	if probes, _ := wave(latencyBase.Add(latencyProbeInterval - 1)); probes != 0 {
+		t.Errorf("wave inside the interval: %d probes, want 0", probes)
+	}
+	if probes, others := wave(latencyBase.Add(latencyProbeInterval)); probes != 1 || others != 63 {
+		t.Errorf("wave after the interval: %d probes and %d known, want 1 and 63", probes, others)
 	}
 }
