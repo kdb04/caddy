@@ -16,12 +16,19 @@ package reverseproxy
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -1006,5 +1013,236 @@ func TestCookieHashPolicyWithSecret(t *testing.T) {
 	cookieHashPolicy.Select(pool, request, w)
 	if len(w.Result().Cookies()) == 0 {
 		t.Error("Expected a new cookie to be set for a non-matching value")
+	}
+}
+
+// noRand fails a test that consults randomness it expects not to need.
+func noRand(n int) int { panic(fmt.Sprintf("unexpected random draw of %d", n)) }
+
+func TestLeastLatencyPolicy(t *testing.T) {
+	const ms = time.Millisecond
+	down := func(u *Upstream) *Upstream {
+		u.setHealthy(false)
+		return u
+	}
+	full := func(u *Upstream) *Upstream {
+		u.MaxRequests = 1
+		u.Host.numRequests.Store(1)
+		return u
+	}
+
+	for _, tc := range []struct {
+		name string
+		pool UpstreamPool
+		want string // dial address of the selected upstream, empty for none
+	}{
+		{"lower latency wins", UpstreamPool{testUpstream("a", 5*ms, 0), testUpstream("b", 20*ms, 0)}, "a"},
+		// scores 5ms*11 and 20ms*1
+		{"active requests outweigh a latency advantage", UpstreamPool{testUpstream("a", 5*ms, 10), testUpstream("b", 20*ms, 0)}, "b"},
+		// both score 20ms
+		{"equal scores go to fewer active requests", UpstreamPool{testUpstream("a", 10*ms, 1), testUpstream("b", 20*ms, 0)}, "b"},
+		{"zero estimates are ranked by active requests", UpstreamPool{testUpstream("a", 0, 3), testUpstream("b", 0, 1)}, "b"},
+		{"without estimates fewer active requests win", UpstreamPool{testUpstream("a", noLatency, 1), testUpstream("b", noLatency, 3)}, "a"},
+		{"empty pool", nil, ""},
+		{"no available upstream", UpstreamPool{down(testUpstream("a", ms, 0)), full(testUpstream("b", ms, 0))}, ""},
+		{"one available upstream", UpstreamPool{down(testUpstream("a", ms, 0)), full(testUpstream("b", ms, 0)), testUpstream("c", ms, 0)}, "c"},
+	} {
+		// the result must not depend on the order of the pool, and with at most
+		// two available upstreams no randomness is needed
+		reversed := slices.Clone(tc.pool)
+		slices.Reverse(reversed)
+		for _, pool := range []UpstreamPool{tc.pool, reversed} {
+			var got string
+			if u := (LeastLatencySelection{}).selectAt(pool, latencyBase, noRand); u != nil {
+				got = u.Dial
+			}
+			if got != tc.want {
+				t.Errorf("%s: selected %q, want %q (first upstream %v)", tc.name, got, tc.want, pool)
+			}
+		}
+	}
+}
+
+// Candidates are drawn from the available upstreams and exact ties are broken
+// by a random draw; the draws are injected to make both deterministic.
+func TestLeastLatencyPolicyRandomChoices(t *testing.T) {
+	const ms = time.Millisecond
+	draw := func(i int) func(int) int { return func(int) int { return i } }
+
+	// three upstreams make three possible candidate pairs, selected by the
+	// draw for the third upstream: (20ms, 10ms), (5ms, 20ms) and (5ms, 10ms)
+	pool := UpstreamPool{testUpstream("5ms", 5*ms, 0), testUpstream("10ms", 10*ms, 0), testUpstream("20ms", 20*ms, 0)}
+	for i, want := range []string{"10ms", "5ms", "5ms"} {
+		if got := (LeastLatencySelection{}).selectAt(pool, latencyBase, draw(i)); got.Dial != want {
+			t.Errorf("draw %d selected %q, want %q", i, got.Dial, want)
+		}
+	}
+
+	for name, pool := range map[string]UpstreamPool{
+		"equal estimates": {testUpstream("a", ms, 0), testUpstream("b", ms, 0)},
+		"no estimates":    {testUpstream("a", noLatency, 0), testUpstream("b", noLatency, 0)},
+	} {
+		if a, b := (LeastLatencySelection{}).selectAt(pool, latencyBase, draw(0)), (LeastLatencySelection{}).selectAt(pool, latencyBase, draw(1)); a == b {
+			t.Errorf("%s: both draws selected %q", name, a.Dial)
+		}
+	}
+
+	// Select uses the current time and its own source of randomness
+	fast, slow := testUpstream("fast", noLatency, 0), testUpstream("slow", noLatency, 0)
+	fast.Host.observeLatency(5 * ms)
+	slow.Host.observeLatency(50 * ms)
+	if got := (LeastLatencySelection{}).Select(UpstreamPool{slow, fast}, nil, nil); got != fast {
+		t.Errorf("Select returned %q, want the faster upstream", got.Dial)
+	}
+}
+
+// An upstream degrades, goes stale, is tried at a bounded rate and recovers.
+func TestLeastLatencyPolicyLifecycle(t *testing.T) {
+	const ms = time.Millisecond
+	a, b := testUpstream("a", 5*ms, 0), testUpstream("b", 5*ms, 0)
+	pick := func(now time.Time) *Upstream {
+		return (LeastLatencySelection{}).selectAt(UpstreamPool{a, b}, now, noRand)
+	}
+
+	// a slow response raises the estimate at once
+	now := latencyBase.Add(time.Second)
+	a.latency.observe(200*ms, now)
+	if got := pick(now); got != b {
+		t.Fatalf("while a is slow: selected %q, want b", got.Dial)
+	}
+
+	// a minute without samples makes a unknown: 32 concurrent requests share a
+	// single trial of it while 32 concurrent responses record samples for b
+	now = latencyBase.Add(62 * time.Second)
+	b.latency.observe(6*ms, now)
+	samples := latencySamples(b)
+	picked := make([]*Upstream, 64)
+	var wg sync.WaitGroup
+	for i := range picked {
+		wg.Go(func() {
+			if i%2 == 0 {
+				picked[i] = pick(now)
+			} else {
+				b.latency.observe(6*ms, now)
+			}
+		})
+	}
+	wg.Wait()
+	if got := latencySamples(b); got != samples+32 {
+		t.Errorf("samples of b = %d, want %d", got, samples+32)
+	}
+	var trials int
+	for _, u := range picked {
+		if u == a {
+			trials++
+		}
+	}
+	if trials != 1 {
+		t.Errorf("concurrent trials of a = %d, want 1", trials)
+	}
+
+	// a stays unknown, so it is tried once per second and no more often
+	trials = 0
+	for at := 100 * ms; at <= 10*time.Second; at += 100 * ms {
+		now = latencyBase.Add(62*time.Second + at)
+		b.latency.observe(6*ms, now)
+		if pick(now) == a {
+			trials++
+		}
+	}
+	if trials != 10 {
+		t.Errorf("trials over 10s = %d, want 10", trials)
+	}
+
+	// one fast response makes a competitive again
+	a.latency.observe(5*ms, now)
+	if got := pick(now); got != a {
+		t.Errorf("after recovery: selected %q, want a", got.Dial)
+	}
+}
+
+// When both candidates are unknown each is still tried only once, and after
+// that the known upstreams are compared.
+func TestLeastLatencyPolicyBothCandidatesUnknown(t *testing.T) {
+	const ms = time.Millisecond
+	sel := LeastLatencySelection{}
+	u1, u2 := testUpstream("u1", noLatency, 0), testUpstream("u2", noLatency, 0)
+	k1, k2, k3 := testUpstream("k1", 5*ms, 0), testUpstream("k2", 8*ms, 0), testUpstream("k3", 30*ms, 0)
+
+	// this draw keeps u1 and u2 as the candidates and claims u2 first
+	last := func(n int) int { return n - 1 }
+	for i, want := range []*Upstream{u2, u1, k1} {
+		if got := sel.selectAt(UpstreamPool{u1, u2, k1}, latencyBase, last); got != want {
+			t.Errorf("selection %d = %q, want %q", i, got.Dial, want.Dial)
+		}
+	}
+
+	// the known upstreams to compare are sampled from the pool: k3 takes the
+	// place of k1, so k2 wins
+	calls := make(map[int]int)
+	replaceFirst := func(n int) int {
+		calls[n]++
+		if n == 3 && calls[n] == 2 {
+			return 0
+		}
+		return n - 1
+	}
+	if got := sel.selectAt(UpstreamPool{u1, u2, k1, k2, k3}, latencyBase, replaceFirst); got != k2 {
+		t.Errorf("selected %q, want k2 as the faster of the sampled k3 and k2", got.Dial)
+	}
+}
+
+func TestLeastLatencyUnmarshalCaddyfile(t *testing.T) {
+	for input, wantErr := range map[string]bool{"least_latency": false, "least_latency 2": true} {
+		var s LeastLatencySelection
+		if err := s.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); (err != nil) != wantErr {
+			t.Errorf("%q: error = %v, want error: %v", input, err, wantErr)
+		}
+	}
+}
+
+// Latency is only recorded for handlers whose policy reads it, including
+// through the fallbacks of other policies.
+func TestProvisionEnablesLatencyTracking(t *testing.T) {
+	const leastLatency = `{"policy":"least_latency"}`
+	tests := []struct {
+		policy string // empty for the default policy
+		want   bool
+	}{
+		{``, false},
+		{`{"policy":"random"}`, false},
+		{leastLatency, true},
+		{`{"policy":"query","key":"k","fallback":` + leastLatency + `}`, true},
+		{`{"policy":"cookie","fallback":{"policy":"header","field":"X-Key","fallback":` + leastLatency + `}}`, true},
+	}
+	var routes []string
+	for i, tc := range tests {
+		lb := `{}`
+		if tc.policy != "" {
+			lb = `{"selection_policy":` + tc.policy + `}`
+		}
+		routes = append(routes, fmt.Sprintf(
+			`{"match":[{"path":["/%d"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"127.0.0.1:1"}],"load_balancing":%s}]}`, i, lb))
+	}
+	var cfg caddy.Config
+	err := json.Unmarshal([]byte(`{"admin":{"disabled":true,"config":{"persist":false}},"apps":{"http":{"servers":{"srv0":{"listen":["127.0.0.1:0"],"routes":[`+
+		strings.Join(routes, ",")+`]}}}}}`), &cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := caddy.Run(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	app, err := caddy.ActiveContext().App("http")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers := app.(*caddyhttp.App).Servers["srv0"].Routes
+	for i, tc := range tests {
+		if got := handlers[i].Handlers[0].(*Handler).trackLatency; got != tc.want {
+			t.Errorf("policy %q: trackLatency = %v, want %v", tc.policy, got, tc.want)
+		}
 	}
 }

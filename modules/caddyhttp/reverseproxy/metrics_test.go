@@ -11,12 +11,10 @@ import (
 // restoreStreamMetrics restores the stream collectors that a test replaces, so
 // later tests do not inherit collectors that cannot be registered.
 func restoreStreamMetrics(t *testing.T) {
-	t.Helper()
-	active, total := reverseProxyMetrics.streamsActive, reverseProxyMetrics.streamsTotal
-	duration, bytes := reverseProxyMetrics.streamDuration, reverseProxyMetrics.streamBytes
+	m := &reverseProxyMetrics
+	active, total, duration, bytes := m.streamsActive, m.streamsTotal, m.streamDuration, m.streamBytes
 	t.Cleanup(func() {
-		reverseProxyMetrics.streamsActive, reverseProxyMetrics.streamsTotal = active, total
-		reverseProxyMetrics.streamDuration, reverseProxyMetrics.streamBytes = duration, bytes
+		m.streamsActive, m.streamsTotal, m.streamDuration, m.streamBytes = active, total, duration, bytes
 	})
 }
 

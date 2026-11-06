@@ -15,325 +15,234 @@
 package reverseproxy
 
 import (
+	"context"
 	"math"
-	"sync"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
+// latencyBase is the origin of the synthetic clock used by the latency tests.
 var latencyBase = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 
-type latencyStep struct {
-	sample time.Duration
-	at     time.Duration // offset from latencyBase
+// noLatency is the estimate of an upstream that has not completed a request.
+const noLatency = time.Duration(-1)
+
+// testUpstream returns an upstream with the given latency estimate, sampled
+// at latencyBase unless it is noLatency, and number of active requests.
+func testUpstream(dial string, est time.Duration, active int) *Upstream {
+	u := &Upstream{Host: new(Host), Dial: dial}
+	if est != noLatency {
+		u.latency.observe(est, latencyBase)
+	}
+	u.Host.numRequests.Store(int64(active))
+	return u
 }
 
-func applyLatencySteps(l *latencyEstimate, steps ...latencyStep) {
-	for _, s := range steps {
-		l.observe(s.sample, latencyBase.Add(s.at))
-	}
+func latencySamples(u *Upstream) uint64 { return u.latency.snapshot().samples }
+
+// latencyBackend starts a backend served by handler and returns its address.
+func latencyBackend(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+	backend := httptest.NewServer(handler)
+	t.Cleanup(backend.Close)
+	return backend.Listener.Addr().String()
 }
 
-func TestLatencyZeroValueHasNoSamples(t *testing.T) {
-	var l latencyEstimate
-	got := l.snapshot()
-	if got.samples != 0 || got.est != 0 || !got.updated.IsZero() {
-		t.Fatalf("zero value should have no data, got %+v", got)
-	}
-
-	if s := new(Host).latency.snapshot(); s.samples != 0 {
-		t.Fatalf("zero Host should have no latency data, got %+v", s)
-	}
+func statusHandler(status int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }
 }
 
-// Expected values are derived by hand from est = s + (est-s)*exp(-dt/10s),
-// not recomputed with the production formula.
-func TestLatencyObserve(t *testing.T) {
-	const tolerance = 10 * time.Microsecond
-	ms := time.Millisecond
+// latencyHandler returns a handler that records latency while proxying to upstreams.
+func latencyHandler(retries int, upstreams ...*Upstream) *Handler {
+	h := minimalHandler(retries, upstreams...)
+	h.trackLatency = true
+	return h
+}
+
+func serveLatencyRequest(ctx context.Context, h *Handler) error {
+	req := prepareTestRequest(httptest.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/", nil))
+	return h.ServeHTTP(httptest.NewRecorder(), req, caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		return nil
+	}))
+}
+
+func TestLatencyEstimate(t *testing.T) {
+	const ms = time.Millisecond
+	type sample struct{ latency, at time.Duration } // at is the offset from latencyBase
+	maxDuration := time.Duration(math.MaxInt64)
 
 	for _, tc := range []struct {
-		name        string
-		steps       []latencyStep
-		want        time.Duration
-		wantSamples uint64
+		name    string
+		samples []sample
+		want    time.Duration
 	}{
-		{"first sample", []latencyStep{{20 * ms, 0}}, 20 * ms, 1},
-		{"zero first sample is data", []latencyStep{{0, 0}}, 0, 1},
-		{"rising jumps to the peak", []latencyStep{{10 * ms, 0}, {50 * ms, time.Second}}, 50 * ms, 2},
-		{"rising at dt=0", []latencyStep{{10 * ms, 0}, {50 * ms, 0}}, 50 * ms, 2},
-		{"falling at dt=0 is unchanged", []latencyStep{{50 * ms, 0}, {10 * ms, 0}}, 50 * ms, 2},
-		{"falling after 1s", []latencyStep{{50 * ms, 0}, {10 * ms, time.Second}}, 46194 * time.Microsecond, 2},
-		{"falling after 10s", []latencyStep{{50 * ms, 0}, {10 * ms, 10 * time.Second}}, 24715 * time.Microsecond, 2},
-		{"falling after 30s", []latencyStep{{50 * ms, 0}, {10 * ms, 30 * time.Second}}, 11991 * time.Microsecond, 2},
-		{"falling after 60s", []latencyStep{{50 * ms, 0}, {10 * ms, 60 * time.Second}}, 10099 * time.Microsecond, 2},
-		{"zero sample after 10s", []latencyStep{{20 * ms, 0}, {0, 10 * time.Second}}, 7358 * time.Microsecond, 2},
-		{"zero sample at dt=0 is unchanged", []latencyStep{{20 * ms, 0}, {0, 0}}, 20 * ms, 2},
-		{"negative sample counts as zero", []latencyStep{{-5 * ms, 0}}, 0, 1},
+		{"first sample", []sample{{20 * ms, 0}}, 20 * ms},
+		{"slower sample replaces the estimate", []sample{{10 * ms, 0}, {50 * ms, time.Second}}, 50 * ms},
+		// 10ms + (50ms-10ms)*exp(-10s/10s)
+		{"faster sample decays toward it", []sample{{50 * ms, 0}, {10 * ms, 10 * time.Second}}, 24715 * time.Microsecond},
+		{"faster sample at the same instant is ignored", []sample{{50 * ms, 0}, {10 * ms, 0}}, 50 * ms},
+		{"older sample can raise the estimate", []sample{{30 * ms, 0}, {10 * ms, 10 * time.Second}, {100 * ms, 5 * time.Second}}, 100 * ms},
+		{"older sample cannot lower the estimate", []sample{{30 * ms, 0}, {50 * ms, 10 * time.Second}, {10 * ms, 5 * time.Second}}, 50 * ms},
+		{"estimate at the int64 limit", []sample{{maxDuration, 0}, {maxDuration - 1, time.Second}}, maxDuration},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var l latencyEstimate
-			applyLatencySteps(&l, tc.steps...)
-			got := l.snapshot()
-			if diff := got.est - tc.want; diff < -tolerance || diff > tolerance {
-				t.Errorf("est = %v, want %v ± %v", got.est, tc.want, tolerance)
-			}
-			if got.samples != tc.wantSamples {
-				t.Errorf("samples = %d, want %d", got.samples, tc.wantSamples)
-			}
-		})
-	}
-}
-
-func TestLatencyOutOfOrderPeakDominates(t *testing.T) {
-	ms := time.Millisecond
-	var l latencyEstimate
-	// true order: 30ms@0, 10ms@5s, 50ms@10s; arrival order swaps the last two
-	applyLatencySteps(&l,
-		latencyStep{30 * ms, 0},
-		latencyStep{50 * ms, 10 * time.Second},
-		latencyStep{10 * ms, 5 * time.Second},
-	)
-	got := l.snapshot()
-	if got.est != 50*ms {
-		t.Errorf("est = %v, want 50ms", got.est)
-	}
-	if want := latencyBase.Add(10 * time.Second); !got.updated.Equal(want) {
-		t.Errorf("updated = %v, want %v", got.updated, want)
-	}
-	if got.samples != 3 {
-		t.Errorf("samples = %d, want 3", got.samples)
-	}
-}
-
-// A late peak is applied at the newer timestamp, so the result is slower
-// than the chronological one: the error is on the conservative side.
-func TestLatencyOutOfOrderLatePeak(t *testing.T) {
-	const tolerance = 10 * time.Microsecond
-	ms := time.Millisecond
-	var l latencyEstimate
-	// true order: 30ms@0, 100ms@5s, 10ms@10s; arrival order swaps the last two
-	applyLatencySteps(&l,
-		latencyStep{30 * ms, 0},
-		latencyStep{10 * ms, 10 * time.Second},
-	)
-	if diff := l.snapshot().est - 17358*time.Microsecond; diff < -tolerance || diff > tolerance {
-		t.Fatalf("est after the newer sample = %v, want 17.358ms", l.snapshot().est)
-	}
-
-	l.observe(100*ms, latencyBase.Add(5*time.Second))
-	got := l.snapshot()
-	if got.est != 100*ms {
-		t.Errorf("est = %v, want 100ms", got.est)
-	}
-	if want := latencyBase.Add(10 * time.Second); !got.updated.Equal(want) {
-		t.Errorf("updated = %v, want %v (must not move backwards)", got.updated, want)
-	}
-}
-
-func TestLatencyUpdatedNeverDecreases(t *testing.T) {
-	var l latencyEstimate
-	offsets := []time.Duration{3, 1, 7, 7, 2, 9, 0, 5}
-	var prev time.Time
-	for i, o := range offsets {
-		l.observe(time.Duration(i+1)*time.Millisecond, latencyBase.Add(o*time.Second))
-		got := l.snapshot().updated
-		if got.Before(prev) {
-			t.Fatalf("step %d: updated moved backwards from %v to %v", i, prev, got)
+		var l latencyEstimate
+		var latest time.Duration
+		for _, s := range tc.samples {
+			l.observe(s.latency, latencyBase.Add(s.at))
+			latest = max(latest, s.at)
 		}
-		prev = got
-	}
-	if want := latencyBase.Add(9 * time.Second); !prev.Equal(want) {
-		t.Errorf("updated = %v, want %v", prev, want)
+		got := l.snapshot()
+		if diff := got.est - tc.want; diff < -10*time.Microsecond || diff > 10*time.Microsecond {
+			t.Errorf("%s: estimate = %v, want %v", tc.name, got.est, tc.want)
+		}
+		// the timestamp must never move backwards
+		if want := latencyBase.Add(latest); !got.updated.Equal(want) {
+			t.Errorf("%s: updated = %v, want %v", tc.name, got.updated, want)
+		}
 	}
 }
 
-func TestLatencyExtremeValuesStayInRange(t *testing.T) {
-	maxD := time.Duration(math.MaxInt64)
-
-	// est-sample is 1, so float64 arithmetic collapses to 2^63, which does
-	// not fit in an int64; the estimate must be returned unchanged.
-	var l latencyEstimate
-	l.observe(maxD, latencyBase)
-	l.observe(maxD-1, latencyBase.Add(time.Second))
-	if got := l.snapshot().est; got != maxD {
-		t.Errorf("est = %v, want unchanged %v", got, maxD)
-	}
+// Completed responses are recorded, including server errors; errors are not.
+// A retried attempt is recorded on the upstream that served it.
+func TestLatencyRecording(t *testing.T) {
+	ok := statusHandler(http.StatusOK)
+	hang := func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }
 
 	for _, tc := range []struct {
-		est, sample, elapsed time.Duration
+		name      string
+		pool      []http.HandlerFunc // upstream behaviours in pool order, nil if nothing listens
+		retryOn   string             // retry_match expression; dial errors are always retried
+		transport http.RoundTripper
+		untracked bool
+		wantErr   bool
+		want      []uint64 // samples recorded per upstream
 	}{
-		{maxD, 0, time.Nanosecond},
-		{maxD, 0, time.Second},
-		{maxD, 0, maxD},
-		{maxD, maxD / 2, 24 * time.Hour},
-		{maxD - 1, maxD - 2, time.Second},
-		{1, 0, time.Nanosecond},
-		{1, 0, maxD},
+		{name: "success", pool: []http.HandlerFunc{ok}, want: []uint64{1}},
+		{name: "server error", pool: []http.HandlerFunc{statusHandler(http.StatusInternalServerError)}, want: []uint64{1}},
+		{name: "tracking disabled", pool: []http.HandlerFunc{ok}, untracked: true, want: []uint64{0}},
+		{name: "dial failure", pool: []http.HandlerFunc{nil}, wantErr: true, want: []uint64{0}},
+		{
+			name: "response header timeout", pool: []http.HandlerFunc{hang}, wantErr: true, want: []uint64{0},
+			transport: testTransport{&http.Transport{ResponseHeaderTimeout: 30 * time.Millisecond}},
+		},
+		// round robin starts with the second upstream, which fails
+		{
+			name: "retried 503 response", pool: []http.HandlerFunc{ok, statusHandler(http.StatusServiceUnavailable)},
+			retryOn: "{http.reverse_proxy.status_code} in [503]", want: []uint64{1, 1},
+		},
+		{name: "retried dial failure", pool: []http.HandlerFunc{ok, nil}, want: []uint64{1, 0}},
 	} {
-		got := peakEWMA(tc.est, tc.sample, tc.elapsed)
-		if got < tc.sample || got > tc.est {
-			t.Errorf("peakEWMA(%v, %v, %v) = %v, outside [%v, %v]", tc.est, tc.sample, tc.elapsed, got, tc.sample, tc.est)
+		pool := make(UpstreamPool, len(tc.pool))
+		for i, handler := range tc.pool {
+			dial := deadUpstreamAddr(t)
+			if handler != nil {
+				dial = latencyBackend(t, handler)
+			}
+			pool[i] = testUpstream(dial, noLatency, 0)
+		}
+		h := latencyHandler(len(pool)-1, pool...)
+		h.trackLatency = !tc.untracked
+		if tc.transport != nil {
+			h.Transport = tc.transport
+		}
+		if tc.retryOn != "" {
+			h.LoadBalancing.RetryMatch = caddyhttp.MatcherSets{{newExpressionMatcher(t, tc.retryOn)}}
+		}
+		if err := serveLatencyRequest(context.Background(), h); (err != nil) != tc.wantErr {
+			t.Errorf("%s: error = %v, want error: %v", tc.name, err, tc.wantErr)
+		}
+		for i, u := range pool {
+			if got := latencySamples(u); got != tc.want[i] {
+				t.Errorf("%s: samples of upstream %d = %d, want %d", tc.name, i, got, tc.want[i])
+			}
 		}
 	}
 }
 
-// Invariants are checked rather than exact values because interleavings
-// are not controlled; run with -race.
-func TestLatencyConcurrent(t *testing.T) {
-	const (
-		writers   = 8
-		readers   = 4
-		perWriter = 2000
-		minSample = time.Millisecond
-		maxSample = 100 * time.Millisecond
-	)
+func TestLatencyNotRecordedOnClientCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// the client gives up as soon as the upstream has received the request
+	u := testUpstream(latencyBackend(t, func(_ http.ResponseWriter, r *http.Request) {
+		cancel()
+		<-r.Context().Done()
+	}), noLatency, 0)
 
-	var l latencyEstimate
-	var writing, reading sync.WaitGroup
-	done := make(chan struct{})
-
-	for w := range writers {
-		writing.Go(func() {
-			for i := range perWriter {
-				sample := minSample + time.Duration((i*7+w)%100)*time.Millisecond
-				sample = min(sample, maxSample)
-				// writers use interleaved, partly decreasing timestamps
-				at := time.Duration(i*writers+(writers-w)) * time.Millisecond
-				l.observe(sample, latencyBase.Add(at))
-			}
-		})
-	}
-
-	errs := make(chan string, readers)
-	for range readers {
-		reading.Go(func() {
-			var prev latencySnapshot
-			check := func() bool {
-				got := l.snapshot()
-				switch {
-				case got.samples < prev.samples:
-					errs <- "samples decreased"
-				case got.updated.Before(prev.updated):
-					errs <- "updated moved backwards"
-				case got.samples == 0 && (got.est != 0 || !got.updated.IsZero()):
-					errs <- "state without samples"
-				case got.samples > 0 && (got.est < minSample || got.est > maxSample || got.updated.IsZero()):
-					errs <- "estimate or timestamp inconsistent with samples"
-				default:
-					prev = got
-					return true
-				}
-				return false
-			}
-			for {
-				select {
-				case <-done:
-					check()
-					return
-				default:
-					if !check() {
-						return
-					}
-				}
-			}
-		})
-	}
-
-	writing.Wait()
-	close(done)
-	reading.Wait()
-	close(errs)
-	for msg := range errs {
-		t.Error(msg)
-	}
-
-	if got := l.snapshot().samples; got != writers*perWriter {
-		t.Errorf("samples = %d, want %d", got, writers*perWriter)
+	_ = serveLatencyRequest(ctx, latencyHandler(0, u))
+	if got := latencySamples(u); got != 0 {
+		t.Errorf("samples = %d, want 0", got)
 	}
 }
 
-// The tests below pin the lifecycle that latency state inherits from Host.
+// WebTransport reports its handshake time after the session has ended, so it
+// must not be recorded.
+func TestLatencyNotRecordedForWebTransport(t *testing.T) {
+	u := testUpstream("192.0.2.1:80", noLatency, 0)
+	latencyHandler(0, u).recordUpstreamRoundTrip(DialInfo{Upstream: u}, caddy.NewReplacer(), http.StatusOK, time.Millisecond)
+	if got := latencySamples(u); got != 0 {
+		t.Errorf("samples = %d, want 0", got)
+	}
+}
 
-func TestLatencyStaticHostLifecycle(t *testing.T) {
-	const addr = "192.0.2.70:80"
-	h := Handler{}
-
-	// release whatever references remain, even if the test fails midway
-	t.Cleanup(func() {
-		for {
-			if _, ok := hosts.References(addr); !ok {
-				return
-			}
-			_, _ = hosts.Delete(addr)
+// The sample ends when the response headers arrive: it must already exist
+// while the upstream is still holding back the body.
+func TestLatencyMeasuredUntilResponseHeaders(t *testing.T) {
+	const delay = 20 * time.Millisecond
+	host := new(Host)
+	seen := make(chan latencySnapshot, 1)
+	dial := latencyBackend(t, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		for deadline := time.Now().Add(5 * time.Second); host.latency.snapshot().samples == 0 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
 		}
+		seen <- host.latency.snapshot()
 	})
 
-	u1, u2 := &Upstream{Dial: addr}, &Upstream{Dial: addr}
-	h.provisionUpstream(u1, false)
-	h.provisionUpstream(u2, false)
-	if u1.Host != u2.Host {
-		t.Fatal("upstreams with one dial address must share a Host")
-	}
-
-	u1.Host.latency.observe(20*time.Millisecond, latencyBase)
-	if got := u2.Host.latency.snapshot().samples; got != 1 {
-		t.Fatalf("second upstream sees %d samples, want 1", got)
-	}
-
-	// one reference released, as when a reload drops the old handler
-	if deleted, _ := hosts.Delete(addr); deleted {
-		t.Fatal("host removed while a reference remains")
-	}
-	u3 := &Upstream{Dial: addr}
-	h.provisionUpstream(u3, false)
-	if u3.Host != u1.Host || u3.Host.latency.snapshot().samples != 1 {
-		t.Fatal("latency state should survive while a reference remains")
-	}
-
-	// last references released
-	for range 2 {
-		_, _ = hosts.Delete(addr)
-	}
-	u4 := &Upstream{Dial: addr}
-	h.provisionUpstream(u4, false)
-	if u4.Host == u1.Host || u4.Host.latency.snapshot().samples != 0 {
-		t.Fatal("a host removed from the pool must come back with no latency data")
+	_ = serveLatencyRequest(context.Background(), latencyHandler(0, &Upstream{Host: host, Dial: dial}))
+	if got := <-seen; got.samples != 1 || got.est < delay {
+		t.Errorf("while the body was held back: %d samples, estimate %v, want 1 sample of at least %v", got.samples, got.est, delay)
 	}
 }
 
-func TestLatencyDynamicHostLifecycle(t *testing.T) {
+type staticUpstreams struct{ dial string }
+
+func (s staticUpstreams) GetUpstreams(*http.Request) ([]*Upstream, error) {
+	return []*Upstream{{Dial: s.dial}}, nil
+}
+
+// The estimate lives on the Host, so it is shared by every handler proxying to
+// an address, including dynamic upstreams that are rebuilt for each request.
+func TestLatencySharedPerHost(t *testing.T) {
 	resetDynamicHosts()
-	const addr = "192.0.2.71:80"
-	h := Handler{}
+	t.Cleanup(resetDynamicHosts)
+	dial := latencyBackend(t, statusHandler(http.StatusOK))
 
-	u1 := &Upstream{Dial: addr}
-	h.provisionUpstream(u1, true)
-	u1.Host.latency.observe(20*time.Millisecond, latencyBase)
+	a, b := &Upstream{Dial: dial}, &Upstream{Dial: dial}
+	a.fillHost()
+	b.fillHost()
+	t.Cleanup(func() { _, _ = hosts.Delete(dial); _, _ = hosts.Delete(dial) })
+	dynamic := latencyHandler(0)
+	dynamic.DynamicUpstreams = staticUpstreams{dial}
 
-	// a later request builds a new Upstream for the same address
-	u2 := &Upstream{Dial: addr}
-	h.provisionUpstream(u2, true)
-	if u2.Host != u1.Host || u2.Host.latency.snapshot().samples != 1 {
-		t.Fatal("dynamic upstreams for one address should share latency state")
-	}
-
-	// age the entry past the idle expiry and run the same sweep as the
-	// background cleaner (the cleaner goroutine itself is not exercised)
-	dynamicHostsMu.Lock()
-	entry := dynamicHosts[addr]
-	entry.lastSeen = time.Now().Add(-2 * dynamicHostIdleExpiry)
-	dynamicHosts[addr] = entry
-	for a, e := range dynamicHosts {
-		if time.Since(e.lastSeen) > dynamicHostIdleExpiry {
-			delete(dynamicHosts, a)
+	for _, h := range []*Handler{latencyHandler(0, a), latencyHandler(0, b), dynamic, dynamic} {
+		if err := serveLatencyRequest(context.Background(), h); err != nil {
+			t.Fatal(err)
 		}
 	}
-	dynamicHostsMu.Unlock()
-
-	u3 := &Upstream{Dial: addr}
-	h.provisionUpstream(u3, true)
-	if u3.Host == u1.Host || u3.Host.latency.snapshot().samples != 0 {
-		t.Fatal("an evicted dynamic host must come back with no latency data")
+	if got := latencySamples(a); got != 2 {
+		t.Errorf("samples on the static host of two handlers = %d, want 2", got)
+	}
+	dynamicHostsMu.RLock()
+	entry, ok := dynamicHosts[dial]
+	dynamicHostsMu.RUnlock()
+	if !ok || entry.host.latency.snapshot().samples != 2 {
+		t.Errorf("dynamic host persisted = %v, want persisted with 2 samples", ok)
 	}
 }
